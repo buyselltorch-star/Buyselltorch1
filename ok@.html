@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="kn">
+<head>
+<meta charset="UTF-8" />
+<title>Market Master AI - Full OHLC Chart & AI Predictor</title>
+<style>
+  body { font-family: Arial, sans-serif; background: #f5f9ff; color:#203459; margin:20px;}
+  h2 { color:#0C4DA5; }
+  label { font-weight:600; margin-top:10px; display:block; }
+  input, button { font-size:14px; padding:6px; margin:8px 0; width:100%; max-width:280px; }
+  button { background:#1867c7; color:#fff; border:none; border-radius:5px; cursor:pointer; }
+  .result-block { margin-top:20px; padding:15px; border: 1px solid #0C4DA5; border-radius:8px; background:#e9f0ff; max-width:480px; }
+  table { border-collapse: collapse; margin-top: 12px; max-width:480px; }
+  th, td { border: 1px solid #0C4DA5; padding: 8px 12px; text-align: center; }
+  canvas { max-width: 680px; margin-top: 20px; }
+</style>
+</head>
+<body>
+
+<h2>Market Master AI - Intraday CE/PE Option Predictor with Chart</h2>
+
+<form id="ohlcForm" onsubmit="return addCandle();">
+  <label>Open:</label><input type="number" step="0.01" id="openInput" required>
+  <label>High:</label><input type="number" step="0.01" id="highInput" required>
+  <label>Low:</label><input type="number" step="0.01" id="lowInput" required>
+  <label>Close:</label><input type="number" step="0.01" id="closeInput" required>
+  <button type="submit">Add Candle</button>
+</form>
+
+<h3>Entered Candles</h3>
+<table id="candlesTable">
+  <thead>
+    <tr><th>#</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Remove</th></tr>
+  </thead>
+  <tbody></tbody>
+</table>
+
+<label>Strike Price (ATM or manual):</label>
+<input type="number" step="0.01" id="strikeInput" placeholder="ಉದಾ: 17500">
+<label>Option LTP:</label>
+<input type="number" step="0.01" id="ltpInput" placeholder="ಉದಾ: 150">
+<label>Quantity (Lots/Shares):</label>
+<input type="number" step="1" id="qtyInput" placeholder="ಉದಾ: 50">
+
+<button onclick="calculateTrade()">Calculate Trade Signal</button>
+
+<div id="result" class="result-block"></div>
+
+<canvas id="candleChart" height="300"></canvas>
+
+<div id="aiResultBlock" style="margin-top:15px; font-size:16px; color:#0C4DA5;"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-chart-financial"></script>
+<script>
+// Candles storage with LocalStorage persistence
+let candles = JSON.parse(localStorage.getItem('candles_arr')) || [];
+
+function saveCandles(){
+  localStorage.setItem('candles_arr', JSON.stringify(candles));
+}
+
+function renderCandlesTable(){
+  let tbody = document.querySelector('#candlesTable tbody');
+  tbody.innerHTML = '';
+  candles.forEach((c,i) => {
+    let row = document.createElement('tr');
+    row.innerHTML = `<td>${i+1}</td><td>${c.open.toFixed(2)}</td><td>${c.high.toFixed(2)}</td><td>${c.low.toFixed(2)}</td><td>${c.close.toFixed(2)}</td>
+    <td><button onclick="removeCandle(${i})" style="background:#cc3250;color:#fff;border:none;padding:4px 7px;cursor:pointer;">X</button></td>`;
+    tbody.appendChild(row);
+  });
+}
+
+function removeCandle(idx){
+  candles.splice(idx,1);
+  saveCandles();
+  renderCandlesTable();
+  renderChart();
+  showAIResult();
+}
+
+function addCandle(){
+  let o = parseFloat(document.getElementById('openInput').value);
+  let h = parseFloat(document.getElementById('highInput').value);
+  let l = parseFloat(document.getElementById('lowInput').value);
+  let c = parseFloat(document.getElementById('closeInput').value);
+  if([o,h,l,c].some(isNaN)){
+    alert('OHLC ಎಲ್ಲಾ ಸರಿಯಾಗಿ ನಮೂದಿಸಿ');
+    return false;
+  }
+  candles.push({open:o, high:h, low:l, close:c});
+  if(candles.length > 50) candles.shift(); // Keep last 50 candles
+  saveCandles();
+  document.getElementById('ohlcForm').reset();
+  renderCandlesTable();
+  renderChart();
+  showAIResult();
+  return false;
+}
+
+// Moving Average calculation
+function SMA(arr, period){
+  if(arr.length < period) return null;
+  let sum = 0;
+  for(let i=arr.length-period; i<arr.length; i++) sum += arr[i];
+  return sum/period;
+}
+
+// RSI calculation
+function RSI(candles, period=14){
+  if(candles.length < period+1) return null;
+  let gains=0, losses=0;
+  for(let i=candles.length-period; i<candles.length; i++){
+    let diff = candles[i].close - candles[i-1].close;
+    if(diff > 0) gains += diff;
+    else losses += -diff;
+  }
+  if(losses === 0) return 100;
+  let rs = gains/losses;
+  return 100 - (100/(1+rs));
+}
+
+// Detect candlestick patterns
+function detectPattern(){
+  if(candles.length < 2) return 'None';
+  let prev = candles[candles.length-2];
+  let curr = candles[candles.length-1];
+
+  if(prev.open > prev.close && curr.open < curr.close && curr.open < prev.close && curr.close > prev.open) return 'Bullish Engulfing';
+  if(prev.open < prev.close && curr.open > curr.close && curr.open > prev.close && curr.close < prev.open) return 'Bearish Engulfing';
+  if(Math.abs(curr.open - curr.close) < (curr.high - curr.low)*0.1) return 'Doji';
+
+  let body = Math.abs(curr.close - curr.open);
+  let candleLength = curr.high - curr.low;
+  let lowerShadow = curr.open < curr.close ? curr.open - curr.low : curr.close - curr.low;
+  if(body < candleLength*0.5 && lowerShadow > body*2) return 'Hammer';
+
+  return 'None';
+}
+
+// AI Prediction combining SMA, RSI, Pattern
+function predictDirection(){
+  if(candles.length < 15) return {direction:'Neutral', confidence:0};
+
+  let closeArr = candles.map(c => c.close);
+  let sma20 = SMA(closeArr, 20);
+  let sma50 = SMA(closeArr, 50);
+  let rsi14 = RSI(candles, 14);
+  let pattern = detectPattern();
+
+  let score = 0;
+  if(sma20 && sma50){
+    score += (sma20 > sma50) ? 1 : -1;
+  }
+  if(rsi14){
+    if(rsi14 < 30) score += 1.5;
+    else if(rsi14 > 70) score -= 1.5;
+  }
+  if(pattern === 'Bullish Engulfing' || pattern === 'Hammer') score += 1.5;
+  else if(pattern === 'Bearish Engulfing') score -= 1.5;
+
+  let confidence = Math.min(1, Math.max(0, 0.5 + score*0.25));
+  let direction = 'Neutral';
+  if(confidence > 0.65) direction = 'Up';
+  else if(confidence < 0.35) direction = 'Down';
+
+  return {direction, confidence};
+}
+
+// Render candlestick chart with next predicted candle in blue
+let candleChart = null;
+function renderChart(){
+  const dataPoints = candles.map((c, i) => ({
+    x: i + 1,
+    o: c.open,
+    h: c.high,
+    l: c.low,
+    c: c.close
+  }));
+
+  let pred = predictNextCandle();
+  if(pred) {
+    dataPoints.push({...pred, x: dataPoints.length + 1, _predicted: true});
+  }
+
+  if(candleChart) candleChart.destroy();
+
+  const ctx = document.getElementById('candleChart').getContext('2d');
+  candleChart = new Chart(ctx, {
+    type: 'candlestick',
+    data: {
+      datasets: [{
+        label: 'OHLC Candles',
+        data: dataPoints,
+        borderColor:'#203459',
+        color: ctx => {
+          let d = ctx.raw;
+          if(d._predicted) return {up: '#156bf7', down: '#156bf7', unchanged:'#156bf7'};
+          return {up: '#13b838', down: '#c4113f', unchanged:'#888'};
+        }
+      }]
+    },
+    options: {
+      plugins: {legend: {display:true, labels:{usePointStyle:true}}},
+      scales: {x: {type: 'linear', title: {display:false}}, y: {title: {display:false}}}
+    }
+  });
+}
+
+// Predict next candle values based on AI direction and body average
+function predictNextCandle(){
+  if(candles.length < 5) return null;
+  let ai = predictDirection();
+  let last = candles[candles.length-1];
+  let avgBody = candles.slice(-5).reduce((acc,c) => acc + Math.abs(c.close - c.open), 0) / 5;
+  let open = last.close;
+  let close = +(
+    ai.direction === 'Up' ? last.close + avgBody :
+    ai.direction === 'Down' ? last.close - avgBody :
+    last.close
+  ).toFixed(2);
+  let high = Math.max(open, close) + 0.5;
+  let low = Math.min(open, close) - 0.5;
+  return {open, high, low, close};
+}
+
+// Show AI prediction result block
+function showAIResult(){
+  let aiBlock = document.getElementById('aiResultBlock');
+  let patt = detectPattern();
+  let ai = predictDirection();
+  aiBlock.innerHTML = `<b>AI Pattern:</b> <span style="color:#0c6b36;">${patt}</span><br>
+    <b>AI Prediction:</b> <span style="color:${ai.direction==='Up'?'#1c8700': ai.direction==='Down'?'#c4113f':'#005199'}">${ai.direction.toUpperCase()} (${(ai.confidence*100).toFixed(1)}% confidence)</span>`;
+}
+
+// Calculate Trade Outputs
+function calculateTrade(){
+  let strike = parseFloat(document.getElementById('strikeInput').value);
+  let ltp = parseFloat(document.getElementById('ltpInput').value);
+  let qty = parseInt(document.getElementById('qtyInput').value);
+
+  if(isNaN(strike) || isNaN(ltp) || isNaN(qty) || qty < 1){
+    alert('Strike Price, LTP ಮತ್ತು Quantity ಸರಿಯಾಗಿ ನಮೂದಿಸಿ');
+    return;
+  }
+
+  let pred = predictDirection();
+  let resultDiv = document.getElementById('result');
+
+  if(pred.direction === 'Neutral'){
+    resultDiv.innerHTML = `<b>ಮಾರುಕಟ್ಟೆ ನ್ಯೂಟ್ರಲ್, ಸ್ಪಷ್ಟ ಸೂಚನೆ ಇಲ್ಲ.</b>`;
+    return;
+  }
+
+  let lastCandle = candles[candles.length - 1];
+  let body = Math.abs(lastCandle.close - lastCandle.open);
+  if(body === 0) body = 1;
+
+  let isCE = pred.direction === 'Up';
+  let isPE = pred.direction === 'Down';
+
+  let entry = ltp;
+  let target = isCE ? +(ltp + body*1.5).toFixed(2) : +(ltp - body*1.5).toFixed(2);
+  let stopLoss = isCE ? +(ltp - body*0.75).toFixed(2) : +(ltp + body*0.75).toFixed(2);
+
+  let totBuy = (entry * qty).toFixed(2);
+  let totTarget = (target * qty).toFixed(2);
+  let totStopLoss = (stopLoss * qty).toFixed(2);
+
+  resultDiv.innerHTML = `
+    <div>
+      <b>ಟ್ರೆಡ್ ಸಿಗ್ನಲ್:</b> ${isCE ? 'Call Option (CE) ಖರೀದಿ ಮಾಡಿರಿ' : 'Put Option (PE) ಖರೀದಿ ಮಾಡಿರಿ'}<br>
+      <b>ವಿಶ್ವಾಸದ ಮಟ್ಟ:</b> ${(pred.confidence*100).toFixed(1)}%<br>
+      <b>ಎಂಟ್ರಿ ಪ್ರೆಸ್:</b> ₹${entry}<br>
+      <b>ಟಾರ್ಗೆಟ್ ಪ್ರಿಸ್:</b> ₹${target}<br>
+      <b>ಸ್ಟಾಪ್ ಲಾಸ್:</b> ₹${stopLoss}<br>
+      <b>ಪ್ರಮಾಣ:</b> ${qty}<br><br>
+      <b>ಒಟ್ಟು ಖರೀದಿ ಮೌಲ್ಯ:</b> ₹${totBuy}<br>
+      <b>ಲಾಭದಾಯಕ ಮೌಲ್ಯ:</b> ₹${totTarget}<br>
+      <b>ನಷ್ಟ ಮೌಲ್ಯ:</b> ₹${totStopLoss}<br>
+    </div>
+  `;
+}
+
+// Initializations
+window.onload = () => {
+  renderCandlesTable();
+  renderChart();
+  showAIResult();
+
+  // Restore strike, ltp, qty input values from localStorage
+  let strikeVal = localStorage.getItem('strike_val');
+  if(strikeVal) document.getElementById('strikeInput').value = strikeVal;
+
+  let ltpVal = localStorage.getItem('ltp_val');
+  if(ltpVal) document.getElementById('ltpInput').value = ltpVal;
+
+  let qtyVal = localStorage.getItem('qty_val');
+  if(qtyVal) document.getElementById('qtyInput').value = qtyVal;
+}
+
+// Save strike, ltp, qty values on input change
+['strikeInput', 'ltpInput', 'qtyInput'].forEach(id => {
+  document.getElementById(id).addEventListener('input', e => {
+    localStorage.setItem(e.target.id + '_val', e.target.value);
+  });
+});
+</script>
+
+</body>
+</html>
